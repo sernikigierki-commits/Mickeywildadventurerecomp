@@ -1,0 +1,37 @@
+# Original media and local builds
+disc/
+**/disc/
+*.cue
+*.bin
+*.iso
+*.chd
+work/
+outputs/
+build/
+build-*/
+
+# Private runtime state
+profiles/
+**/profiles/
+ra_cache/
+ra_states/
+retroachievements.ini
+disc.cfg
+*.mcd
+*.state
+*.sav
+*.srm
+*.log
+*.jsonl
+project/psxrecomp/recompiler/lib/ELFIO/tests/elf_examples/*.so
+psx_freeze_*.json
+psx_last_run_report.json
+
+# Local tooling
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

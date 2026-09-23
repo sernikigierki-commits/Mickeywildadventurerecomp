@@ -1,0 +1,37 @@
+[game]
+name = "Mickey's Wild Adventure"
+id = "SCES-00163"
+players = 1
+exe = "disc/SCES_001.63"
+# Point this at the COMPLETE 28-track cue when running the game.
+# disc = "D:/PSX/Mickey's Wild Adventure (Europe).cue"
+load_address = "0x80010000"
+entry_pc = "0x8007FF88"
+text_size = "0xA0000"
+stack_base = "0x801FFFF0"
+
+[recompiler]
+seeds = "seeds/ghidra_funcs.txt"
+out_dir = "generated"
+strict = true
+
+[runtime]
+window_title = "Mickey's Wild Adventure Recompiled"
+bios_hle = false
+fast_boot = true
+debug_port = 4370
+
+[video]
+renderer = "opengl"
+
+[prepare_disc]
+out_dir = "disc"
+boot_exe = "SCES_001.63"
+known_sizes = [24498432]
+known_md5 = ["d84c39a6a52ec1b98bee312fcd8283dd"]
+known_sha1 = ["23e42703729ea84b50551f05c8538b457f35c26f"]
+
+[netplay]
+require_cue = true
+required_tracks = 28
+# required_disc_fp is intentionally omitted until all 28 track files are present.
