@@ -14,6 +14,8 @@ This project aims to preserve the original game while making it easier and more 
 ![Mickey's Wild Adventure Recompiled gameplay](docs/images/screenshot-gameplay.png)
 
 ---
+[Trailer](https://youtu.be/ZzpwqbgKv98)
+---
 
 ## Features
 
