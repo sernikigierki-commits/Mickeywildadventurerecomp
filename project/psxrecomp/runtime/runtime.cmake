@@ -1675,7 +1675,10 @@ function(psxrecomp_add_runtime_target target)
         # This is what a player gets when they choose no BIOS.
         PSX_BUNDLED_BIOS_PATH="${PSXRECOMP_BUNDLED_BIOS_PATH}"
         PSX_DEFAULT_GAME_CONFIG_PATH="${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
-        PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
+        # windres forwards -D through its preprocessor with different quoting.
+        # The icon resource does not use this C/C++ string (which may contain
+        # an apostrophe); keep it off the RC command line.
+        "$<$<COMPILE_LANGUAGE:C,CXX>:PSX_WINDOW_TITLE=\"${PSXRT_WINDOW_TITLE}\">"
         PSX_MAX_PLAYERS=${PSXRT_MAX_PLAYERS}
         FMT_HEADER_ONLY=1
         $<$<PLATFORM_ID:Windows>:NOMINMAX>

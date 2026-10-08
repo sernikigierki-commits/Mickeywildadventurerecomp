@@ -35,7 +35,42 @@ if(NOT MSVC)
 endif()
 
 # Rabbitizer MIPS decoder
+# The source snapshot ships templates but not generated headers or the Bash
+# generator. Generate both C and C++ tables with the selected C preprocessor.
+set(_rabbitizer "${CMAKE_CURRENT_SOURCE_DIR}/lib/rabbitizer")
+file(GLOB_RECURSE _rabbitizer_table_inputs CONFIGURE_DEPENDS
+    "${_rabbitizer}/tables/tables/*.inc")
+set(_rabbitizer_headers "")
+foreach(_language c cplusplus)
+    if(_language STREQUAL "c")
+        set(_header_dir "include")
+        set(_extension h)
+    else()
+        set(_header_dir "cplusplus/include")
+        set(_extension hpp)
+    endif()
+    file(GLOB _templates CONFIGURE_DEPENDS "${_rabbitizer}/tables/templates/${_language}/*.table.template")
+    foreach(_template IN LISTS _templates)
+        get_filename_component(_name "${_template}" NAME)
+        string(REPLACE ".table.template" ".${_extension}" _name "${_name}")
+        set(_output "${CMAKE_CURRENT_BINARY_DIR}/rabbitizer/${_header_dir}/generated/${_name}")
+        add_custom_command(OUTPUT "${_output}"
+            COMMAND "${CMAKE_COMMAND}" "-DCOMPILER=${CMAKE_C_COMPILER}"
+                "-DMSVC_MODE=${MSVC}" "-DINPUT=${_template}" "-DOUTPUT=${_output}"
+                "-DTABLES=${_rabbitizer}/tables/tables"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_rabbitizer_table.cmake"
+            DEPENDS "${_template}" ${_rabbitizer_table_inputs}
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/generate_rabbitizer_table.cmake"
+            COMMENT "Generating Rabbitizer ${_name}" VERBATIM)
+        list(APPEND _rabbitizer_headers "${_output}")
+    endforeach()
+endforeach()
+add_custom_target(rabbitizer-tables DEPENDS ${_rabbitizer_headers})
 add_library(rabbitizer STATIC)
+add_dependencies(rabbitizer rabbitizer-tables)
+target_include_directories(rabbitizer PUBLIC
+    "${CMAKE_CURRENT_BINARY_DIR}/rabbitizer/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/rabbitizer/cplusplus/include")
 target_sources(rabbitizer PRIVATE
     lib/rabbitizer/cplusplus/src/analysis/LoPairingInfo.cpp
     lib/rabbitizer/cplusplus/src/analysis/RegistersTracker.cpp

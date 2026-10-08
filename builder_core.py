@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
-import platform
 import re
 import shlex
 import shutil
@@ -14,6 +14,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Callable
+
+from build_dependencies import BuildError, Dependency, DependencyReport, check_dependencies, launch_error
+from windows_package import stage_windows_dependencies
 
 ROOT = Path(__file__).resolve().parent
 PROJECT = ROOT / "project"
@@ -33,8 +36,23 @@ REQUIRED_ASSETS = (
 Log = Callable[[str], None]
 
 
-class BuildError(RuntimeError):
-    pass
+def check_build_dependencies(target: str) -> DependencyReport:
+    report = check_dependencies(target)
+    framework = PROJECT / "psxrecomp"
+    required = [PROJECT / "embedded_openbios.cpp", framework / "bios/OpenBIOS.toml",
+                framework / "recompiler/seeds/openbios_elf_seeds.json",
+                framework / "recompiler/CMakeLists.txt", framework / "recompiler/src/main_bios.cpp",
+                framework / "recompiler/cmake/generate_rabbitizer_table.cmake"]
+    missing = [str(path) for path in required if not path.is_file()]
+    detail = ("Sources ready. Build Studio prepares and generates the backend automatically on Build."
+              if not missing else "OpenBIOS generator inputs are missing: " + ", ".join(missing) +
+              ". Restore these files from a complete project checkout; no Sony BIOS is needed.")
+    report.dependencies.append(Dependency("OpenBIOS generation", str(framework), detail, ok=not missing))
+    if report.host == "linux" and target == "windows":
+        native = generator_dependencies(report)
+        report.dependencies.extend(Dependency("BIOS generator " + item.name, item.path, item.detail,
+                                              required=item.required, ok=item.ok) for item in native.dependencies)
+    return report
 
 
 def within(path: Path, base: Path) -> bool:
@@ -85,88 +103,226 @@ def has_serial(track: Path) -> bool:
 
 
 def run(command: list[str], log: Log, *, cwd: Path, env: dict[str, str] | None = None) -> None:
-    log("$ " + " ".join(shlex.quote(str(part)) for part in command))
+    effective_env = os.environ.copy() if env is None else env
+    executable = shutil.which(str(command[0]), path=effective_env.get("PATH", ""))
+    if executable is None:
+        raise BuildError(launch_error(str(command[0]), FileNotFoundError("executable was not found"), cwd=cwd))
+    command = [str(Path(executable).resolve()), *map(str, command[1:])]
+    log("$ " + (subprocess.list2cmdline(command) if os.name == "nt" else shlex.join(command)))
     try:
         process = subprocess.Popen(
-            command, cwd=cwd, env=env, stdout=subprocess.PIPE,
+            command, cwd=cwd, env=effective_env, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1,
         )
     except OSError as exc:
-        raise BuildError(f"Unable to start build tool: {exc}") from exc
+        raise BuildError(launch_error(command[0], exc, cwd=cwd)) from exc
     assert process.stdout is not None
     for line in process.stdout:
         log(line.rstrip())
     if process.wait() != 0:
-        raise BuildError(f"Build command failed with exit code {process.returncode}.")
+        raise BuildError(f"Build command '{command[0]}' failed with exit code {process.returncode}. See the build log above.")
 
 
 def windows_env() -> dict[str, str]:
-    env = os.environ.copy()
-    candidates = [Path(os.environ.get("MSYS2_ROOT", "C:/msys64")) / "mingw64/bin"]
-    compiler_dir = next((p for p in candidates if (p / "gcc.exe").is_file()), None)
-    if compiler_dir is None:
-        raise BuildError("Windows build requires MSYS2 MINGW64 at C:/msys64 (or MSYS2_ROOT).")
-    env["PATH"] = str(compiler_dir) + os.pathsep + env.get("PATH", "")
-    env["CC"] = str(compiler_dir / "gcc.exe")
-    env["CXX"] = str(compiler_dir / "g++.exe")
-    return env
+    report = check_dependencies("windows")
+    report.require()
+    return report.env
 
 
-def wsl_path(path: Path) -> str:
-    result = subprocess.run(
-        ["wsl.exe", "--exec", "wslpath", "-a", str(path)],
-        capture_output=True, text=True, timeout=30,
-    )
+def wsl_path(path: Path, report: DependencyReport) -> str:
+    try:
+        result = subprocess.run(
+            [*report.launcher, "wslpath", "-a", str(path)], env=report.env,
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise BuildError(launch_error(report.tools["wsl"], exc)) from exc
     if result.returncode or not result.stdout.strip():
-        raise BuildError("WSL is required to build Linux on a Windows host.")
+        raise BuildError(f"WSL could not convert the path '{path}'. Check that the default Linux distribution can access it.")
     return result.stdout.strip()
 
 
 def prepare_openbios() -> Path:
-    source = (PROJECT / "embedded_openbios.cpp").read_text(encoding="ascii")
+    try:
+        source = (PROJECT / "embedded_openbios.cpp").read_text(encoding="ascii")
+    except (OSError, UnicodeError) as exc:
+        raise BuildError(f"Cannot read the bundled OpenBIOS source: {exc}. Restore project/embedded_openbios.cpp.") from exc
     marker = "static const unsigned char kEmbeddedOpenBios[] = {"
     if marker not in source:
         raise BuildError("Embedded OpenBIOS source is missing.")
     array = source.split(marker, 1)[1].split("};", 1)[0]
     data = bytes(int(value, 16) for value in re.findall(r"0x([0-9A-Fa-f]{2})\b", array))
-    if hashlib.sha256(data).hexdigest() != OPENBIOS_SHA256:
+    if len(data) != 524288 or hashlib.sha256(data).hexdigest() != OPENBIOS_SHA256:
         raise BuildError("Embedded OpenBIOS data failed its integrity check.")
-    destination = ROOT / "work/openbios.bin"
+    destination = PROJECT / "psxrecomp/bios/openbios.bin"
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.is_file() or destination.read_bytes() != data:
         destination.write_bytes(data)
     return destination
 
 
-def build_commands(target: str, build_dir: Path, bios: Path) -> tuple[list[str], list[str], dict[str, str] | None]:
-    host = platform.system().lower()
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def generator_dependencies(runtime: DependencyReport) -> DependencyReport:
+    if runtime.host != "linux" or runtime.target != "windows":
+        return runtime
+    # Cross-compilers produce Windows executables, which cannot be run by the
+    # Linux build host. The BIOS emitter must itself be a native host tool.
+    env = runtime.env.copy()
+    env["CC"] = env.get("BIOS_CC", "gcc")
+    env["CXX"] = env.get("BIOS_CXX", "g++")
+    for key in ("AR", "LD", "RANLIB"):
+        env[key] = env.get("BIOS_" + key, key.lower())
+    return check_dependencies("linux", environ=env, host="linux")
+
+
+def openbios_fingerprint(env: dict[str, str]) -> str:
+    framework = PROJECT / "psxrecomp"
+    digest = hashlib.sha256(b"Build Studio OpenBIOS pipeline v1\n" + OPENBIOS_SHA256.encode())
+    for name in ("PSX_CPS", "PSX_CODEGEN_CYCLE_PER_INSN"):
+        digest.update((name + "=" + env.get(name, "") + "\n").encode())
+    paths = [framework / "bios/OpenBIOS.toml", framework / "recompiler/seeds/openbios_elf_seeds.json"]
+    for directory in (framework / "recompiler", framework / "runtime/include"):
+        paths.extend(path for path in directory.rglob("*") if path.is_file() and
+                     (path.suffix in {".cpp", ".c", ".h", ".hpp", ".inc", ".template", ".cmake"} or path.name == "CMakeLists.txt"))
+    for path in sorted(set(paths)):
+        digest.update(str(path.relative_to(framework)).replace("\\", "/").encode())
+        digest.update(file_sha256(path).encode())
+    return digest.hexdigest()
+
+
+def validate_openbios_generated(directory: Path) -> dict[str, str]:
+    hashes = {}
+    for name in ("OpenBIOS_full.c", "OpenBIOS_dispatch.c"):
+        path = directory / name
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise BuildError(f"OpenBIOS generation did not produce a readable {path}: {exc}.") from exc
+        if f"BIOS SHA256: {OPENBIOS_SHA256}" not in source or '#include "cpu_state.h"' not in source:
+            raise BuildError(f"Generated {name} has invalid OpenBIOS provenance or runtime headers. Regenerate it with Build Studio.")
+        if name.endswith("dispatch.c") and not re.search(r"const\s+PsxBiosBackend\s+OpenBIOS_psx_bios_backend\s*=\s*\{", source):
+            raise BuildError("OpenBIOS_dispatch.c does not define the backend descriptor required by runtime.cmake.")
+        if name.endswith("full.c") and not re.search(r"void\s+OpenBIOS_\w+\s*\(CPUState\*", source):
+            raise BuildError("OpenBIOS_full.c contains no generated OpenBIOS functions.")
+        hashes[name] = file_sha256(path)
+    return hashes
+
+
+def prepare_openbios_backend(bios: Path, dependencies: DependencyReport, log: Log) -> None:
+    framework = PROJECT / "psxrecomp"
+    generated = framework / "generated"
+    stamp = generated / ".build-studio-openbios.json"
+    try:
+        valid_rom = bios.stat().st_size == 524288 and file_sha256(bios) == OPENBIOS_SHA256
+    except OSError as exc:
+        raise BuildError(f"Cannot verify recovered OpenBIOS image {bios}: {exc}. Retry Build to recover it from the embedded source.") from exc
+    if not valid_rom:
+        raise BuildError("OpenBIOS binary failed SHA-256 validation. Restore the embedded source and retry Build.")
+    generator = generator_dependencies(dependencies)
+    generator.require()
+    try:
+        fingerprint = openbios_fingerprint(generator.env)
+    except OSError as exc:
+        raise BuildError(f"Cannot read OpenBIOS generator inputs: {exc}. Restore the profile, seeds and emitter sources, then retry Build.") from exc
+    try:
+        cached = json.loads(stamp.read_text(encoding="utf-8"))
+        if cached["inputs"] == fingerprint and cached["outputs"] == validate_openbios_generated(generated):
+            log("Reusing verified generated OpenBIOS backend (ROM, profile, seeds and emitter unchanged).")
+            return
+    except (OSError, ValueError, KeyError, TypeError, BuildError):
+        pass
+    log("Preparing the MIT-licensed OpenBIOS backend; first build compiles the BIOS generator.")
+    mode = "wsl-linux" if generator.launcher else generator.target
+    # Separate native toolchain caches: CMake can discard command-line options
+    # when an existing cache switches compilers. Keep that from re-enabling CHD.
+    toolchain_key = hashlib.sha256((generator.tools["gcc"] + "\n" + generator.tools["g++"]).encode()).hexdigest()[:10]
+    build_dir = ROOT / "work" / ("bios-generator-" + mode + "-" + toolchain_key)
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    def tool_path(path: Path) -> str:
+        return wsl_path(path, generator) if generator.launcher else str(path)
+
+    common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF",
+              "-DPSXRECOMP_ENABLE_CHD=OFF", "-DCMAKE_TOOLCHAIN_FILE=",
+              f"-DCMAKE_MAKE_PROGRAM={generator.tools['ninja']}",
+              f"-DCMAKE_C_COMPILER={generator.tools['gcc']}",
+              f"-DCMAKE_CXX_COMPILER={generator.tools['g++']}",
+              f"-DCMAKE_AR={generator.tools['ar']}",
+              f"-DCMAKE_LINKER={generator.tools['ld']}",
+              f"-DCMAKE_RANLIB={generator.tools['ranlib']}"]
+    if generator.target == "windows":
+        common.append("-DPSXRECOMP_STATIC_CLI=ON")
+    work = ROOT / "work"
+    try:
+        log("Configuring BIOS code generator (C++20, bundled fmt/Rabbitizer, no CHD download)...")
+        run([*generator.launcher, generator.tools["cmake"], "-S", tool_path(framework / "recompiler"),
+             "-B", tool_path(build_dir), *common], log, cwd=ROOT, env=generator.env)
+        log("Building psxrecomp-bios and generating Rabbitizer headers...")
+        run([*generator.launcher, generator.tools["cmake"], "--build", tool_path(build_dir),
+             "--target", "psxrecomp-bios", "--parallel", "4"], log, cwd=ROOT, env=generator.env)
+        suffix = ".exe" if generator.target == "windows" else ""
+        executable = build_dir / ("psxrecomp-bios" + suffix)
+        if not executable.is_file():
+            raise BuildError(f"BIOS generator executable was not produced: {executable}.")
+        with tempfile.TemporaryDirectory(prefix="openbios-", dir=work) as staging:
+            stage = Path(staging)
+            log("Generating OpenBIOS C from the pinned profile and verified ROM...")
+            run([*generator.launcher, tool_path(executable), "--config", tool_path(framework / "bios/OpenBIOS.toml"),
+                 "--rom", tool_path(bios), "--out-dir", tool_path(stage)], log, cwd=ROOT, env=generator.env)
+            hashes = validate_openbios_generated(stage)
+            log("Checking generated OpenBIOS C against the runtime headers...")
+            # Validate with the target compiler as well as the emitter's identity
+            # gate. The runtime build later performs the actual compile/link.
+            for name in hashes:
+                source = wsl_path(stage / name, dependencies) if dependencies.launcher else str(stage / name)
+                include = wsl_path(framework / "runtime/include", dependencies) if dependencies.launcher else str(framework / "runtime/include")
+                run([*dependencies.launcher, dependencies.tools["gcc"], "-std=c99", "-fsyntax-only", "-I", include, source],
+                    log, cwd=ROOT, env=dependencies.env)
+            generated.mkdir(parents=True, exist_ok=True)
+            stamp.unlink(missing_ok=True)
+            for path in stage.glob("OpenBIOS_*"):
+                destination = generated / path.name
+                if not destination.is_file() or file_sha256(destination) != file_sha256(path):
+                    path.replace(destination)
+            stamp_tmp = generated / ".build-studio-openbios.tmp"
+            stamp_tmp.write_text(json.dumps({"inputs": fingerprint, "outputs": hashes}, indent=2), encoding="utf-8")
+            stamp_tmp.replace(stamp)
+    except (BuildError, OSError) as exc:
+        raise BuildError(f"OpenBIOS preparation failed: {exc}\nCheck the BIOS stage in the build log, restore missing project sources, "
+                         "and use a C++20-capable GCC/G++ toolchain. Then click Retry Check and Build again.") from exc
+    log("OpenBIOS backend verified and ready for runtime compilation.")
+
+
+def build_commands(target: str, build_dir: Path, bios: Path,
+                   dependencies: DependencyReport | None = None) -> tuple[list[str], list[str], dict[str, str]]:
+    report = dependencies if dependencies is not None else check_dependencies(target)
+    report.require()
     common = ["-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DPSX_SDL_BACKEND=SDL3",
-              f"-DPSX_DEBUG_TOOLS={'OFF' if target == 'linux' else 'ON'}"]
-    if host == "windows" and target == "windows":
-        env = windows_env()
-        return (["cmake", "-S", str(PROJECT), "-B", str(build_dir), *common,
-                 f"-DPSXRECOMP_BUNDLED_BIOS_SOURCE={bios}"],
-                ["cmake", "--build", str(build_dir), "--parallel", "4"], env)
-    if host == "linux" and target == "linux":
-        return (["cmake", "-S", str(PROJECT), "-B", str(build_dir), *common,
-                 f"-DPSXRECOMP_BUNDLED_BIOS_SOURCE={bios}"],
-                ["cmake", "--build", str(build_dir), "--parallel", "4"], None)
-    if host == "windows" and target == "linux":
-        source, build = wsl_path(PROJECT), wsl_path(build_dir)
-        configure = ["cmake", "-S", source, "-B", build, *common,
-                     f"-DPSXRECOMP_BUNDLED_BIOS_SOURCE={wsl_path(bios)}"]
-        compile_cmd = ["cmake", "--build", build, "--parallel", "4"]
-        return (["wsl.exe", "--exec", *configure], ["wsl.exe", "--exec", *compile_cmd], None)
-    if host == "linux" and target == "windows":
-        compiler = shutil.which("x86_64-w64-mingw32-gcc")
-        if not compiler:
-            raise BuildError("Windows cross-build requires the MinGW-w64 cross compiler.")
-        toolchain = ROOT / "toolchains/mingw64.cmake"
-        return (["cmake", "-S", str(PROJECT), "-B", str(build_dir), *common,
-                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
-                 f"-DPSXRECOMP_BUNDLED_BIOS_SOURCE={bios}"],
-                ["cmake", "--build", str(build_dir), "--parallel", "4"], None)
-    raise BuildError(f"Unsupported host/target combination: {host}/{target}.")
+              f"-DPSX_DEBUG_TOOLS={'OFF' if target == 'linux' else 'ON'}",
+              f"-DCMAKE_MAKE_PROGRAM={report.tools['ninja']}",
+              f"-DCMAKE_C_COMPILER={report.tools['gcc']}",
+              f"-DCMAKE_CXX_COMPILER={report.tools['g++']}",
+              f"-DCMAKE_AR={report.tools['ar']}",
+              f"-DCMAKE_LINKER={report.tools['ld']}",
+              f"-DCMAKE_RANLIB={report.tools['ranlib']}"]
+    if target == "windows":
+        common.append(f"-DCMAKE_RC_COMPILER={report.tools['windres']}")
+    if report.host == "linux" and target == "windows":
+        common.append(f"-DCMAKE_TOOLCHAIN_FILE={ROOT / 'toolchains/mingw64.cmake'}")
+    source, build, bios_source = str(PROJECT), str(build_dir), str(bios)
+    if report.launcher:
+        source, build, bios_source = (wsl_path(path, report) for path in (PROJECT, build_dir, bios))
+    cmake = report.tools["cmake"]
+    return ([*report.launcher, cmake, "-S", source, "-B", build, *common,
+             f"-DPSXRECOMP_BUNDLED_BIOS_SOURCE={bios_source}"],
+            [*report.launcher, cmake, "--build", build, "--parallel", "4"], report.env)
 
 
 def find_executable(build_dir: Path, target: str) -> Path:
@@ -203,7 +359,8 @@ def validate_assets() -> None:
         raise BuildError("Display frames are incomplete: " + ", ".join(missing_borders))
 
 
-def package(executable: Path, target: str, cue: Path, tracks: list[Path], output_root: Path, log: Log) -> Path:
+def package(executable: Path, target: str, cue: Path, tracks: list[Path], output_root: Path, log: Log,
+            dependencies: DependencyReport | None = None) -> Path:
     validate_assets()
     parent = output_root.expanduser().resolve() / target.capitalize()
     parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +371,8 @@ def package(executable: Path, target: str, cue: Path, tracks: list[Path], output
     try:
         output_exe = temporary / (PRODUCT + (".exe" if target == "windows" else ""))
         shutil.copy2(executable, output_exe)
+        if target == "windows":
+            stage_windows_dependencies(executable, temporary, dependencies, log, packaged_name=output_exe.name)
         if target == "linux":
             output_exe.chmod(output_exe.stat().st_mode | 0o111)
         for name in ("assets", "Border", "mods"):
@@ -232,6 +391,10 @@ def package(executable: Path, target: str, cue: Path, tracks: list[Path], output
         licenses.mkdir()
         shutil.copy2(PROJECT / "psxrecomp/bios/OpenBIOS.LICENSE", licenses / "OpenBIOS.LICENSE")
         shutil.copy2(PROJECT / "psxrecomp/third_party/rcheevos/LICENSE", licenses / "rcheevos-LICENSE.txt")
+        bios_dir = temporary / "bios"
+        bios_dir.mkdir()
+        shutil.copy2(prepare_openbios(), bios_dir / "openbios.bin")
+        shutil.copy2(PROJECT / "psxrecomp/bios/OpenBIOS.LICENSE", bios_dir / "OpenBIOS.LICENSE")
         disc_out = temporary / "disc"
         disc_out.mkdir()
         log("Copying the selected disc into the local game package...")
@@ -263,6 +426,11 @@ def package(executable: Path, target: str, cue: Path, tracks: list[Path], output
 def build(target: str, disc_folder: Path, output_root: Path, log: Log = print) -> Path:
     if target not in {"windows", "linux"}:
         raise BuildError("Choose Windows or Linux.")
+    log("Checking build tools...")
+    dependencies = check_build_dependencies(target)
+    for line in dependencies.lines():
+        log(line)
+    dependencies.require()
     if not (PROJECT / "generated/SCES_001.63_dispatch.c").is_file():
         raise BuildError("The generated source snapshot is incomplete.")
     validate_assets()
@@ -270,15 +438,17 @@ def build(target: str, disc_folder: Path, output_root: Path, log: Log = print) -
     log(f"Verified disc: {cue.name} ({len(tracks)} tracks)")
     build_dir = ROOT / "work" / f"build-{target}"
     build_dir.mkdir(parents=True, exist_ok=True)
+    log("Recovering and verifying the bundled OpenBIOS ROM...")
     bios = prepare_openbios()
-    configure, compile_cmd, env = build_commands(target, build_dir, bios)
+    prepare_openbios_backend(bios, dependencies, log)
+    configure, compile_cmd, env = build_commands(target, build_dir, bios, dependencies)
     log("Configuring native runtime...")
     run(configure, log, cwd=ROOT, env=env)
     log("Compiling and linking the complete game...")
     run(compile_cmd, log, cwd=ROOT, env=env)
     executable = find_executable(build_dir, target)
     log(f"Linked executable: {executable.name}")
-    final = package(executable, target, cue, tracks, output_root, log)
+    final = package(executable, target, cue, tracks, output_root, log, dependencies)
     log(f"Ready: {final}")
     return final
 
@@ -286,11 +456,26 @@ def build(target: str, disc_folder: Path, output_root: Path, log: Log = print) -
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a local game package from a user-owned disc")
     parser.add_argument("--target", choices=("windows", "linux"), required=True)
-    parser.add_argument("--disc-folder", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--check-dependencies", action="store_true", help="Check build tools without a disc or compilation")
+    parser.add_argument("--wine-smoke", action="store_true", help="Optional Wine headless startup check after a Linux-to-Windows build")
+    parser.add_argument("--disc-folder", type=Path)
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     try:
-        build(args.target, args.disc_folder, args.output)
+        if args.check_dependencies:
+            report = check_build_dependencies(args.target)
+            for line in report.lines():
+                print(line)
+            report.require()
+        else:
+            if args.disc_folder is None or args.output is None:
+                parser.error("--disc-folder and --output are required for a build")
+            final = build(args.target, args.disc_folder, args.output)
+            if args.wine_smoke:
+                if args.target != "windows" or os.name == "nt":
+                    raise BuildError("--wine-smoke is available for Windows packages on Linux.")
+                from wine_validation import wine_smoke
+                wine_smoke(final, ROOT / "work/wine-check")
     except BuildError as exc:
         parser.exit(1, f"Error: {exc}\n")
 

@@ -14,6 +14,21 @@ MIT-licensed **OpenBIOS** alternative is bundled (`bios/openbios.bin`, see
 game you always supply your own legally-obtained **disc image** — this
 project ships no game data.
 
+## This bundled Mickey project
+
+This snapshot is embedded in Mickey's Wild Adventure Recompiled. Start the repository's
+`START_BUILDER_WINDOWS.bat` or `START_BUILDER_LINUX.sh` and click Build. Its Python builder
+performs OpenBIOS recovery, hash validation, native `psxrecomp-bios` compilation, Rabbitizer
+header generation and profile-driven emission automatically before runtime configuration.
+It reuses verified generated outputs and packages the OpenBIOS ROM with its MIT notice.
+The `tools/regen_bios.sh` references below describe the full upstream developer workflow;
+that script is not shipped in this snapshot and is not required by Build Studio.
+
+The original profile resolves its paths relative to this framework directory:
+`bios/openbios.bin`, `recompiler/seeds/openbios_elf_seeds.json`, and `generated/OpenBIOS_*.c`.
+The builder recovers the ROM from the game's `embedded_openbios.cpp`; it does not supply
+or generate any proprietary Sony BIOS.
+
 ## Toolchain requirements
 
 - A C/C++ toolchain:

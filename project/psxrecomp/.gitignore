@@ -4,7 +4,9 @@ bios/*
 # OpenBIOS is MIT — the one BIOS image that is legal to track (see
 # THIRD_PARTY_ATTRIBUTION.md; pin recorded in bios/OpenBIOS.toml; notice
 # shipped alongside as bios/OpenBIOS.LICENSE).
-!bios/openbios.bin
+# Build Studio recovers the pinned image from project/embedded_openbios.cpp.
+# Keep this local generated copy out of source commits.
+bios/openbios.bin
 !bios/*.LICENSE
 
 # DuckStation — upstream source is a git submodule pointing at stenzek/duckstation.
